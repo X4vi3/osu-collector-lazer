@@ -1,0 +1,58 @@
+name: release
+
+# Push a tag like v0.2.0 (scripts/release.ps1 does it) to build and publish a release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - run: npm ci
+
+      - name: build installer, sign updater artifacts, create release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Collector → Lazer ${{ github.ref_name }}"
+          releaseBody: |
+            **Windows 10/11 x64.**
+
+            - `Collector.to.Lazer_*_x64-setup.exe` — installer, updates itself from inside the app.
+            - `Collector-to-Lazer-portable.exe` — no install, just run it (updates are downloaded manually).
+
+            ---
+
+            - `…x64-setup.exe` — установщик, обновляется прямо из приложения.
+            - `Collector-to-Lazer-portable.exe` — без установки, просто запустить (обновления скачиваются вручную).
+          releaseDraft: false
+          prerelease: false
+
+      - name: attach portable exe
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          Copy-Item src-tauri/target/release/collector-to-lazer.exe Collector-to-Lazer-portable.exe
+          gh release upload "${{ github.ref_name }}" Collector-to-Lazer-portable.exe --clobber

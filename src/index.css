@@ -1,0 +1,128 @@
+@import "tailwindcss";
+@import "@fontsource-variable/onest";
+@import "@fontsource-variable/unbounded";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Violet-grey neutrals in the spirit of lazer's UI; pink is reserved for actions. */
+:root {
+  --background: #f5f2f8;
+  --foreground: #1e1925;
+  --card: #ffffff;
+  --card-foreground: #1e1925;
+  --popover: #ffffff;
+  --popover-foreground: #1e1925;
+  --primary: #e8478f;
+  --primary-foreground: #ffffff;
+  --secondary: #ebe6f1;
+  --secondary-foreground: #1e1925;
+  --muted: #ebe6f1;
+  --muted-foreground: #6a6276;
+  --accent: #e4dded;
+  --accent-foreground: #1e1925;
+  --destructive: #d93a4a;
+  --success: #2f9e63;
+  --warning: #c98a12;
+  --border: #ddd6e6;
+  --input: #d5cddf;
+  --ring: #e8478f;
+  --raised: #efeaf4;
+}
+
+.dark {
+  --background: #18151d;
+  --foreground: #f1edf6;
+  --card: #221e29;
+  --card-foreground: #f1edf6;
+  --popover: #2a2532;
+  --popover-foreground: #f1edf6;
+  --primary: #ff66aa;
+  --primary-foreground: #2a0a1a;
+  --secondary: #2d2837;
+  --secondary-foreground: #f1edf6;
+  --muted: #2d2837;
+  --muted-foreground: #a198ae;
+  --accent: #352f40;
+  --accent-foreground: #f1edf6;
+  --destructive: #ff5c6c;
+  --success: #5fd396;
+  --warning: #ffc94d;
+  --border: #342e3e;
+  --input: #3d3648;
+  --ring: #ff66aa;
+  --raised: #2a2532;
+}
+
+@theme inline {
+  --font-sans: "Onest Variable", system-ui, sans-serif;
+  --font-display: "Unbounded Variable", "Onest Variable", sans-serif;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-raised: var(--raised);
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 20px;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-feature-settings: "tnum" 1;
+    overflow: hidden;
+    user-select: none;
+  }
+  input,
+  textarea,
+  .selectable {
+    user-select: text;
+  }
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--input);
+    border-radius: 10px;
+    border: 3px solid transparent;
+    background-clip: content-box;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
