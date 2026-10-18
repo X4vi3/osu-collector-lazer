@@ -1,7 +1,7 @@
 {
   "name": "collector-to-lazer",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "scripts": {
     "dev": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run.ps1 tauri dev --features mcp-bridge --config src-tauri/tauri.dev.conf.json",

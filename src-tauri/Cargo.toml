@@ -1,6 +1,6 @@
 [package]
 name = "collector-to-lazer"
-version = "0.1.0"
+version = "0.1.1"
 description = "osu!collector -> osu!lazer downloader with star filter"
 authors = ["Xavie"]
 license = "MIT"
