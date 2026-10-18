@@ -3,13 +3,17 @@
 //! Mirrors throttle per connection (catboy ≈ 0.5 MB/s each) and per IP (osu.direct: 120 req/min,
 //! burst 25/5 s), so all enabled mirrors are used at once, each with its own parallel cap.
 //! A rate-limited mirror cools down while other mirrors keep downloading.
+//! A set crawling from a slow mirror is raced by another free mirror, so one bad server
+//! cannot hold the tail of a collection hostage.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
@@ -162,34 +166,84 @@ impl MirrorPool {
         }
     }
 
-    /// First mirror in preference order that is not excluded, not cooling down and has a free slot.
-    /// Waits while all candidates are busy. `None` when every mirror is excluded.
+    /// First mirror in preference order that is not excluded, not cooling down and has a free slot now.
+    fn try_acquire(&self, exclude: &HashSet<Mirror>) -> Option<(Mirror, OwnedSemaphorePermit)> {
+        let now = Instant::now();
+        self.slots
+            .iter()
+            .filter(|s| !exclude.contains(&s.mirror))
+            .filter(|s| *s.cooldown_until.lock().unwrap() <= now)
+            .find_map(|s| Some((s.mirror, s.sem.clone().try_acquire_owned().ok()?)))
+    }
+
+    /// Like `try_acquire`, but waits while all candidates are busy. `None` when every mirror is excluded.
     async fn acquire(
         &self,
         exclude: &HashSet<Mirror>,
         ctl: &Control,
     ) -> Result<Option<(Mirror, OwnedSemaphorePermit)>, DownloadError> {
         loop {
-            let mut any = false;
-            let now = Instant::now();
-            for s in &self.slots {
-                if exclude.contains(&s.mirror) {
-                    continue;
-                }
-                any = true;
-                if *s.cooldown_until.lock().unwrap() > now {
-                    continue;
-                }
-                if let Ok(p) = s.sem.clone().try_acquire_owned() {
-                    return Ok(Some((s.mirror, p)));
-                }
-            }
-            if !any {
+            if self.slots.iter().all(|s| exclude.contains(&s.mirror)) {
                 return Ok(None);
+            }
+            if let Some(got) = self.try_acquire(exclude) {
+                return Ok(Some(got));
             }
             ctl.sleep(Duration::from_millis(150)).await?;
         }
     }
+}
+
+/// Bytes received by one attempt, read by `download_set` while the attempt streams.
+#[derive(Default)]
+struct Live {
+    done: AtomicU64,
+    /// 0 = unknown
+    total: AtomicU64,
+}
+
+impl Live {
+    fn fraction(&self) -> Option<f32> {
+        let total = self.total.load(Ordering::Relaxed);
+        (total > 0).then(|| (self.done.load(Ordering::Relaxed) as f64 / total as f64) as f32)
+    }
+}
+
+/// One mirror currently downloading the set.
+struct Running {
+    live: Arc<Live>,
+    cancel: CancellationToken,
+    /// bytes already passed to `progress`
+    seen: u64,
+    /// start of the current speed window: (when, bytes done then)
+    mark: (Instant, u64),
+}
+
+/// How often running attempts are sampled for progress and speed.
+const SAMPLE: Duration = Duration::from_millis(250);
+/// Speed is judged over windows this long.
+const HEDGE_WINDOW: Duration = Duration::from_secs(10);
+/// Slower than this, a second mirror is raced against the first (catboy alone gives ≈ 500 KB/s).
+const HEDGE_SLOW_BPS: u64 = 150 * 1024;
+/// ...unless the download is about to finish anyway.
+const HEDGE_MIN_ETA: Duration = Duration::from_secs(20);
+
+/// The current speed window has run long and the attempt is crawling with a lot left.
+fn is_slow(r: &Running, now: Instant) -> bool {
+    let (since, at) = r.mark;
+    let age = now - since;
+    if age < HEDGE_WINDOW {
+        return false;
+    }
+    let done = r.live.done.load(Ordering::Relaxed);
+    let bps = (done - at) as f64 / age.as_secs_f64();
+    if bps >= HEDGE_SLOW_BPS as f64 {
+        return false;
+    }
+    let total = r.live.total.load(Ordering::Relaxed);
+    total == 0
+        || bps <= 0.0
+        || (total.saturating_sub(done)) as f64 / bps > HEDGE_MIN_ETA.as_secs_f64()
 }
 
 enum Attempt {
@@ -230,8 +284,49 @@ fn rate_limit_wait(resp: &reqwest::Response) -> Duration {
     Duration::from_secs(s.clamp(2, 120))
 }
 
+/// Passes bytes received since the last call to `progress`, with the fraction done by the attempt
+/// furthest along; `on_mirror` hears whenever that leading attempt changes.
+fn report(
+    running: &mut HashMap<Mirror, Running>,
+    shown: &mut (Option<Mirror>, Option<f32>),
+    on_mirror: &mut impl FnMut(Mirror),
+    progress: &mut impl FnMut(u64, Option<f32>),
+) {
+    let mut new = 0;
+    for r in running.values_mut() {
+        let done = r.live.done.load(Ordering::Relaxed);
+        new += done - r.seen;
+        r.seen = done;
+    }
+    let frac = |m: &Mirror| running[m].live.fraction().unwrap_or(0.0);
+    let mut leader = shown.0.filter(|m| running.contains_key(m));
+    for m in running.keys() {
+        if leader.is_none_or(|l| frac(m) > frac(&l)) {
+            leader = Some(*m);
+        }
+    }
+    let Some(leader) = leader else { return };
+    let f = running[&leader].live.fraction();
+    if shown.0 != Some(leader) {
+        on_mirror(leader);
+    }
+    if new > 0 || f != shown.1 {
+        progress(new, f);
+    }
+    *shown = (Some(leader), f);
+}
+
+/// Cancels every running attempt and waits for them to clean up their partial files.
+async fn stop_all<F: Future>(running: &HashMap<Mirror, Running>, tasks: &mut FuturesUnordered<F>) {
+    for r in running.values() {
+        r.cancel.cancel();
+    }
+    while tasks.next().await.is_some() {}
+}
+
 /// Downloads `set_id` into `dest` using whichever mirror is free, falling back across mirrors.
-/// Calls `progress(done, total)` while streaming. Returns the mirror that succeeded.
+/// A download that crawls is raced by a second free mirror; whichever finishes first wins.
+/// Calls `progress(new_bytes, fraction)` while streaming. Returns the mirror that succeeded.
 pub async fn download_set(
     client: &reqwest::Client,
     set_id: u64,
@@ -239,25 +334,99 @@ pub async fn download_set(
     dest: &Path,
     ctl: &Control,
     mut on_mirror: impl FnMut(Mirror),
-    mut progress: impl FnMut(u64, Option<u64>),
+    mut progress: impl FnMut(u64, Option<f32>),
 ) -> Result<Mirror, DownloadError> {
     let mut exhausted: HashSet<Mirror> = HashSet::new();
     let mut attempts: HashMap<Mirror, u32> = HashMap::new();
     let mut outcomes: HashMap<Mirror, Outcome> = HashMap::new();
     let mut last: Option<DownloadError> = None;
+    let mut backoff: Option<Duration> = None;
+    let mut running: HashMap<Mirror, Running> = HashMap::new();
+    let mut tasks = FuturesUnordered::new();
+    let mut shown: (Option<Mirror>, Option<f32>) = (None, None);
+    let mut tick = tokio::time::interval(SAMPLE);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // every attempt writes its own .part file, so two mirrors can race on one set
+    let launch =
+        |mirror: Mirror, permit: OwnedSemaphorePermit, running: &mut HashMap<Mirror, Running>| {
+            let live = Arc::new(Live::default());
+            let cancel = ctl.cancel.child_token();
+            running.insert(
+                mirror,
+                Running {
+                    live: live.clone(),
+                    cancel: cancel.clone(),
+                    seen: 0,
+                    mark: (Instant::now(), 0),
+                },
+            );
+            let actl = Control {
+                cancel,
+                paused: ctl.paused.clone(),
+            };
+            let part = dest.with_extension(format!("{mirror:?}.part"));
+            let url = mirror.url(set_id);
+            async move {
+                let r = try_once(client, url, &part, dest, &actl, &live).await;
+                drop(permit);
+                (mirror, r)
+            }
+        };
 
     loop {
-        ctl.checkpoint().await?;
-        let Some((mirror, permit)) = pool.acquire(&exhausted, ctl).await? else {
-            break;
+        if tasks.is_empty() {
+            if let Some(d) = backoff.take() {
+                ctl.sleep(d).await?;
+            }
+            ctl.checkpoint().await?;
+            let Some((mirror, permit)) = pool.acquire(&exhausted, ctl).await? else {
+                break;
+            };
+            tasks.push(launch(mirror, permit, &mut running));
+        }
+        let (mirror, res) = tokio::select! {
+            Some(finished) = tasks.next() => finished,
+            _ = tick.tick() => {
+                report(&mut running, &mut shown, &mut on_mirror, &mut progress);
+                let now = Instant::now();
+                let paused = *ctl.paused.borrow();
+                let mut hedge_from = None;
+                for (&m, r) in running.iter_mut() {
+                    if paused || now - r.mark.0 >= HEDGE_WINDOW {
+                        // a paused attempt is not slow: its window restarts
+                        if !paused && is_slow(r, now) {
+                            hedge_from = Some(m);
+                        }
+                        r.mark = (now, r.live.done.load(Ordering::Relaxed));
+                    }
+                }
+                if let Some(m) = hedge_from.filter(|_| running.len() == 1) {
+                    let mut exclude = exhausted.clone();
+                    exclude.insert(m);
+                    if let Some((m2, permit)) = pool.try_acquire(&exclude) {
+                        tasks.push(launch(m2, permit, &mut running));
+                    }
+                }
+                continue;
+            }
         };
-        on_mirror(mirror);
-        let res = try_once(client, mirror.url(set_id), dest, ctl, &mut progress).await;
-        drop(permit);
+        report(&mut running, &mut shown, &mut on_mirror, &mut progress);
+        running.remove(&mirror);
+        let res = match res {
+            Ok(a) => a,
+            Err(e) => {
+                stop_all(&running, &mut tasks).await;
+                return Err(e);
+            }
+        };
         let n = attempts.entry(mirror).or_default();
         *n += 1;
-        match res? {
-            Attempt::Ok => return Ok(mirror),
+        match res {
+            Attempt::Ok => {
+                stop_all(&running, &mut tasks).await;
+                return Ok(mirror);
+            }
             Attempt::RateLimited(wait) => {
                 pool.cool_down(mirror, wait);
                 last = Some(DownloadError::Failed {
@@ -285,8 +454,8 @@ pub async fn download_set(
                 });
                 if *n >= 3 {
                     exhausted.insert(mirror);
-                } else {
-                    ctl.sleep(Duration::from_secs(1 << *n)).await?;
+                } else if tasks.is_empty() {
+                    backoff = Some(Duration::from_secs(1 << *n));
                 }
             }
             Attempt::NextMirror { reason, not_found } => {
@@ -330,9 +499,10 @@ pub async fn download_set(
 async fn try_once(
     client: &reqwest::Client,
     url: String,
+    part: &Path,
     dest: &Path,
     ctl: &Control,
-    progress: &mut impl FnMut(u64, Option<u64>),
+    live: &Live,
 ) -> Result<Attempt, DownloadError> {
     let resp = tokio::select! {
         _ = ctl.cancel.cancelled() => return Err(DownloadError::Cancelled),
@@ -374,21 +544,19 @@ async fn try_once(
         });
     }
 
-    let total = resp.content_length();
-    let part = dest.with_extension("part");
-    let mut file = tokio::fs::File::create(&part)
+    live.total
+        .store(resp.content_length().unwrap_or(0), Ordering::Relaxed);
+    let mut file = tokio::fs::File::create(part)
         .await
         .map_err(|e| DownloadError::Failed {
             mirror: "-",
             reason: crate::trf!("не удалось создать файл: {e}", "could not create file: {e}"),
         })?;
-    let mut done = 0u64;
-    progress(0, total);
     let mut stream = resp.bytes_stream();
     loop {
         if let Err(e) = ctl.checkpoint().await {
             drop(file);
-            let _ = tokio::fs::remove_file(&part).await;
+            let _ = tokio::fs::remove_file(part).await;
             return Err(e);
         }
         let chunk = tokio::select! {
@@ -397,7 +565,7 @@ async fn try_once(
         };
         let Some(chunk) = chunk else {
             drop(file);
-            let _ = tokio::fs::remove_file(&part).await;
+            let _ = tokio::fs::remove_file(part).await;
             return Err(DownloadError::Cancelled);
         };
         match chunk {
@@ -405,18 +573,17 @@ async fn try_once(
             Some(Ok(bytes)) => {
                 if let Err(e) = file.write_all(&bytes).await {
                     drop(file);
-                    let _ = tokio::fs::remove_file(&part).await;
+                    let _ = tokio::fs::remove_file(part).await;
                     return Err(DownloadError::Failed {
                         mirror: "-",
                         reason: crate::trf!("запись на диск: {e}", "disk write: {e}"),
                     });
                 }
-                done += bytes.len() as u64;
-                progress(done, total);
+                live.done.fetch_add(bytes.len() as u64, Ordering::Relaxed);
             }
             Some(Err(e)) => {
                 drop(file);
-                let _ = tokio::fs::remove_file(&part).await;
+                let _ = tokio::fs::remove_file(part).await;
                 return Ok(Attempt::Retry {
                     reason: crate::trf!(
                         "сеть: обрыв загрузки ({})",
@@ -431,11 +598,16 @@ async fn try_once(
     let _ = file.flush().await;
     drop(file);
 
-    let check = part.clone();
+    let check = part.to_path_buf();
     let valid = tokio::task::spawn_blocking(move || trim::osu_hashes(&check)).await;
     match valid {
+        // another mirror already won the race
+        Ok(Ok(_)) if ctl.cancel.is_cancelled() => {
+            let _ = tokio::fs::remove_file(part).await;
+            Err(DownloadError::Cancelled)
+        }
         Ok(Ok(_)) => {
-            tokio::fs::rename(&part, dest)
+            tokio::fs::rename(part, dest)
                 .await
                 .map_err(|e| DownloadError::Failed {
                     mirror: "-",
@@ -447,14 +619,14 @@ async fn try_once(
             Ok(Attempt::Ok)
         }
         Ok(Err(e)) => {
-            let _ = tokio::fs::remove_file(&part).await;
+            let _ = tokio::fs::remove_file(part).await;
             Ok(Attempt::NextMirror {
                 reason: crate::trf!("плохой архив: {e}", "bad archive: {e}"),
                 not_found: false,
             })
         }
         Err(e) => {
-            let _ = tokio::fs::remove_file(&part).await;
+            let _ = tokio::fs::remove_file(part).await;
             Ok(Attempt::NextMirror {
                 reason: e.to_string(),
                 not_found: false,
@@ -539,6 +711,49 @@ mod tests {
         let all: HashSet<Mirror> = [Mirror::OsuDirect, Mirror::Catboy].into();
         assert!(pool.acquire(&all, &c).await.unwrap().is_none());
         assert_eq!(pool.capacity(), 10);
+    }
+
+    #[test]
+    fn try_acquire_never_waits() {
+        let pool = MirrorPool::new(&[Mirror::Nerinyan]);
+        let none = HashSet::new();
+        let held: Vec<_> = (0..Mirror::Nerinyan.max_parallel())
+            .map(|_| pool.try_acquire(&none).unwrap())
+            .collect();
+        assert!(pool.try_acquire(&none).is_none());
+        drop(held);
+        assert!(pool.try_acquire(&[Mirror::Nerinyan].into()).is_none());
+    }
+
+    fn running(done: u64, total: u64, window_start: u64, age: Duration) -> (Running, Instant) {
+        let live = Arc::new(Live::default());
+        live.done.store(done, Ordering::Relaxed);
+        live.total.store(total, Ordering::Relaxed);
+        let now = Instant::now() + age;
+        let r = Running {
+            live,
+            cancel: CancellationToken::new(),
+            seen: 0,
+            mark: (now - age, window_start),
+        };
+        (r, now)
+    }
+
+    #[test]
+    fn slow_means_crawling_with_a_lot_left() {
+        let w = HEDGE_WINDOW;
+        // 65 KB/s with 10 MB to go: race it
+        let (r, now) = running(650 * 1024, 11 << 20, 0, w);
+        assert!(is_slow(&r, now));
+        // stalled, size unknown
+        let (r, now) = running(0, 0, 0, w);
+        assert!(is_slow(&r, now));
+        // catboy-like 500 KB/s is fine
+        let (r, now) = running(5000 * 1024, 30 << 20, 0, w);
+        assert!(!is_slow(&r, now));
+        // slow but almost done
+        let (r, now) = running(1 << 20, (1 << 20) + 100 * 1024, 0, w);
+        assert!(!is_slow(&r, now));
     }
 
     /// Live download through the real mirrors; `cargo test -- --ignored`.

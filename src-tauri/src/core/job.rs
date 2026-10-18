@@ -423,7 +423,6 @@ impl Job {
             r.status = SetStatus::Downloading;
             r.progress = 0.0;
         });
-        let mut last_done = 0u64;
         let result = loop {
             let r = download::download_set(
                 &self.client,
@@ -432,15 +431,10 @@ impl Job {
                 &raw,
                 ctl,
                 |m| self.update(idx, |r| r.mirror = Some(m.label())),
-                |done, total| {
+                |new_bytes, fraction| {
                     let mut inner = self.inner.lock().unwrap();
-                    if done < last_done {
-                        last_done = 0;
-                    }
-                    inner.bytes += done - last_done;
-                    last_done = done;
-                    inner.rows[idx].progress =
-                        total.map_or(0.0, |t| (done as f64 / t.max(1) as f64) as f32);
+                    inner.bytes += new_bytes;
+                    inner.rows[idx].progress = fraction.unwrap_or(0.0);
                     inner.dirty.insert(idx);
                 },
             )
